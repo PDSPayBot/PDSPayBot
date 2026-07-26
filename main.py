@@ -15,17 +15,17 @@ PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY")
 raw_group_id = os.getenv("GROUP_ID")
 GROUP_ID = int(raw_group_id) if raw_group_id else None
 
-AMOUNT = 520000  # 5,200 KES in cents/subunits
+AMOUNT = 4000  # $40.00 USD in cents (1 USD = 100 cents)
 
 app = FastAPI()
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 
 # ---------- Telegram Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("Pay 5,200 KES", callback_data="pay")]]
+    keyboard = [[InlineKeyboardButton("Pay $40.00 USD", callback_data="pay")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "Welcome!\n\nClick the button below to pay **5,200 KES** and get instant access to the group.",
+        "Welcome!\n\nClick the button below to pay **$40.00 USD** (approx. £30) and get instant access to the group.",
         reply_markup=reply_markup,
         parse_mode="Markdown"
     )
@@ -42,9 +42,9 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Content-Type": "application/json"
     }
     payload = {
-        "email": f"user_{user.id}@telegram.com",  # Valid top-level domain format for Paystack
+        "email": f"user_{user.id}@telegram.com",  # Standard valid domain format
         "amount": AMOUNT,
-        "currency": "KES",
+        "currency": "USD",  # Set currency to USD
         "reference": reference,
         "metadata": {
             "telegram_id": user.id,
@@ -64,7 +64,7 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.get("status"):
         payment_url = data["data"]["authorization_url"]
         
-        keyboard = [[InlineKeyboardButton("💳 Click Here to Pay 5,200 KES", url=payment_url)]]
+        keyboard = [[InlineKeyboardButton("💳 Click Here to Pay $40.00 USD", url=payment_url)]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
