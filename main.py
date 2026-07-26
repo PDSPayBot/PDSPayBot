@@ -1,8 +1,6 @@
 import os
 import uuid
-import asyncio
 import httpx
-import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -44,8 +42,8 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Content-Type": "application/json"
     }
     payload = {
-        "email": f"{user.id}@telegram.user",  # Temporary email for Paystack
-        "amount": AMOUNT,                     # Fixed variable reference
+        "email": f"{user.id}@telegram.user",
+        "amount": AMOUNT,
         "currency": "KES",
         "reference": reference,
         "metadata": {
@@ -66,7 +64,6 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.get("status"):
         payment_url = data["data"]["authorization_url"]
         
-        # Generates a direct URL button for Telegram
         keyboard = [[InlineKeyboardButton("💳 Click Here to Pay 5,200 KES", url=payment_url)]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -78,6 +75,21 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         print("Paystack error:", data)
         await query.edit_message_text("Something went wrong generating your payment link. Please try again later.")
+
+# Register Handlers
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(CallbackQueryHandler(pay_callback, pattern="^pay$"))
+
+
+# ---------- Webhook Endpoint for Telegram Updates ----------
+@app.post("/telegram-webhook")
+async def telegram_webhook(request: Request):
+    """Receives commands and button clicks from Telegram safely without polling conflicts."""
+    data = await request.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return {"status": "ok"}
+
 
 # ---------- Paystack Webhook ----------
 @app.post("/paystack-webhook")
@@ -127,23 +139,14 @@ async def paystack_webhook(request: Request):
 
     return {"status": "success"}
 
-# ---------- Startup ----------
-async def main():
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CallbackQueryHandler(pay_callback, pattern="^pay$"))
 
-    # Start Telegram bot polling
+# ---------- App Lifecycle ----------
+@app.on_event("startup")
+async def on_startup():
     await telegram_app.initialize()
     await telegram_app.start()
-    await telegram_app.updater.start_polling()
 
-    # Get port assigned by Render (defaults to 8000 locally)
-    port = int(os.getenv("PORT", 8000))
-
-    # Start FastAPI server
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
-    server = uvicorn.Server(config)
-    await server.serve()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+@app.on_event("shutdown")
+async def on_shutdown():
+    await telegram_app.stop()
+    await telegram_app.shutdown()
