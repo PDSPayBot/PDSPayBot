@@ -42,7 +42,7 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Content-Type": "application/json"
     }
     payload = {
-        "email": f"{user.id}@telegram.user",
+        "email": f"user_{user.id}@telegram.com",  # Valid top-level domain format for Paystack
         "amount": AMOUNT,
         "currency": "KES",
         "reference": reference,
