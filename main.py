@@ -1,23 +1,28 @@
 import os
 import uuid
+import asyncio
 import httpx
+import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-import asyncio
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY")
-GROUP_ID = int(os.getenv("GROUP_ID"))
-AMOUNT = 520000  # 5,200 KES in cents
+
+# Read GROUP_ID safely
+raw_group_id = os.getenv("GROUP_ID")
+GROUP_ID = int(raw_group_id) if raw_group_id else None
+
+AMOUNT = 520000  # 5,200 KES in cents/subunits
 
 app = FastAPI()
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 
-# ---------- Telegram handlers ----------
+# ---------- Telegram Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("Pay 5,200 KES", callback_data="pay")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -34,17 +39,15 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
     reference = f"tg_{user.id}_{uuid.uuid4().hex[:8]}"
 
-    # Create Paystack transaction
     headers = {
         "Authorization": f"Bearer {PAYSTACK_SECRET}",
         "Content-Type": "application/json"
     }
     payload = {
-        "email": f"{user.id}@telegram.user",  # temporary email
-        "amount": amount,
+        "email": f"{user.id}@telegram.user",  # Temporary email for Paystack
+        "amount": AMOUNT,                     # Fixed variable reference
         "currency": "KES",
         "reference": reference,
-        "callback_url": "https://t.me/",  # optional
         "metadata": {
             "telegram_id": user.id,
             "telegram_username": user.username or "",
@@ -62,36 +65,44 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.get("status"):
         payment_url = data["data"]["authorization_url"]
+        
+        # Generates a direct URL button for Telegram
+        keyboard = [[InlineKeyboardButton("💳 Click Here to Pay 5,200 KES", url=payment_url)]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
         await query.edit_message_text(
-            f"Click the link below to complete payment of **5,200 KES**:\n\n{payment_url}\n\n"
-            "After payment you will automatically receive the group invite link.",
-            parse_mode="Markdown"
+            "Your payment link is ready! Click the button below to complete your checkout on Paystack.\n\n"
+            "Once completed, you will automatically receive your invite link right here.",
+            reply_markup=reply_markup
         )
     else:
-        await query.edit_message_text("Something went wrong. Please try again later.")
+        print("Paystack error:", data)
+        await query.edit_message_text("Something went wrong generating your payment link. Please try again later.")
 
 # ---------- Paystack Webhook ----------
 @app.post("/paystack-webhook")
 async def paystack_webhook(request: Request):
     payload = await request.json()
 
-    # Basic verification (you can add signature check later)
     if payload.get("event") != "charge.success":
         return {"status": "ignored"}
 
     data = payload.get("data", {})
-    reference = data.get("reference", "")
     metadata = data.get("metadata", {})
     telegram_id = metadata.get("telegram_id")
 
     if not telegram_id:
         raise HTTPException(status_code=400, detail="No telegram_id")
 
+    if not GROUP_ID:
+        print("Error: GROUP_ID is not configured in Environment Variables.")
+        return {"status": "error", "message": "GROUP_ID not set"}
+
     # Create one-time invite link
     try:
         invite = await telegram_app.bot.create_chat_invite_link(
             chat_id=GROUP_ID,
-            member_limit=1,          # only 1 use
+            member_limit=1,
             name=f"Paid-{telegram_id}"
         )
         invite_link = invite.invite_link
@@ -99,7 +110,7 @@ async def paystack_webhook(request: Request):
         print("Error creating invite:", e)
         return {"status": "error"}
 
-    # Send the invite link to the user
+    # Send invite link to the user
     try:
         await telegram_app.bot.send_message(
             chat_id=telegram_id,
@@ -112,7 +123,7 @@ async def paystack_webhook(request: Request):
             parse_mode="Markdown"
         )
     except Exception as e:
-        print("Error sending message:", e)
+        print("Error sending message to user:", e)
 
     return {"status": "success"}
 
@@ -121,16 +132,18 @@ async def main():
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CallbackQueryHandler(pay_callback, pattern="^pay$"))
 
-    # Start Telegram bot in background (polling)
+    # Start Telegram bot polling
     await telegram_app.initialize()
     await telegram_app.start()
     await telegram_app.updater.start_polling()
 
-    # Start FastAPI
-    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
+    # Get port assigned by Render (defaults to 8000 locally)
+    port = int(os.getenv("PORT", 8000))
+
+    # Start FastAPI server
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
 
 if __name__ == "__main__":
-    import uvicorn
     asyncio.run(main())
