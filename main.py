@@ -1,6 +1,6 @@
 import os
-import re
 import uuid
+import datetime
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
@@ -9,10 +9,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
-    ConversationHandler,
     ContextTypes,
-    filters,
 )
 
 load_dotenv()
@@ -23,81 +20,124 @@ PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY")
 raw_group_id = os.getenv("GROUP_ID")
 GROUP_ID = int(raw_group_id) if raw_group_id else None
 
-AMOUNT = 520000  # 5,200 KES in cents
-
-# State definition for collecting email
-WAITING_FOR_EMAIL = 1
+AMOUNT = 520000  # 5,200 KES in subunits (approx $40 USD / £30 GBP)
+PAYMENT_TTL_MINUTES = 10  # 10 minute expiration period
 
 app = FastAPI()
-telegram_app = Application.builder().token(BOT_TOKEN).build()
+
+# Build Telegram app with JobQueue enabled
+telegram_app = (
+    Application.builder()
+    .token(BOT_TOKEN)
+    .read_timeout(10)
+    .write_timeout(10)
+    .connect_timeout(10)
+    .pool_timeout(10)
+    .build()
+)
 
 
-# ---------- Telegram Handlers ----------
+# ---------- Expiration Job Handler ----------
+
+async def expire_payment_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job triggered after 10 minutes to revoke the payment button in chat."""
+    job_data = context.job.data
+    chat_id = job_data["chat_id"]
+    message_id = job_data["message_id"]
+
+    try:
+        keyboard = [[InlineKeyboardButton("🔄 Generate New Payment Link", callback_data="pay")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=(
+                "⏱️ **Payment Link Expired**\n\n"
+                "Your 10-minute checkout session has ended to keep your account secure.\n\n"
+                "Tap the button below to generate a new payment link when you're ready:"
+            ),
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        print(f"Could not update expired message: {e}")
+
+
+# ---------- Support Helper Function ----------
+
+async def send_support_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reusable function for Support via command or button click."""
+    text = (
+        "💬 **Contact Support**\n\n"
+        "If you need any help, have questions, or need assistance with your group access, "
+        "please reach out to our team. We will get back to you as soon as possible!\n\n"
+        "👉 Message directly: @pewee7"
+    )
+    keyboard = [[InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_start")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, reply_markup=reply_markup, parse_mode="Markdown"
+        )
+    elif update.message:
+        await update.message.reply_text(
+            text, reply_markup=reply_markup, parse_mode="Markdown"
+        )
+
+
+# ---------- Telegram Command Handlers ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcome message with payment button."""
+    """Main welcome message with direct Checkout and Support options."""
     keyboard = [
         [InlineKeyboardButton("💳 Pay $40.00 USD / £30 GBP", callback_data="pay")],
-        [
-            InlineKeyboardButton("❓ FAQ & Info", callback_data="faq"),
-            InlineKeyboardButton("💬 Support", callback_data="support"),
-        ],
+        [InlineKeyboardButton("💬 Support / Help", callback_data="support")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     user_name = update.effective_user.first_name
-    await update.message.reply_text(
+    text = (
         f"👋 Hey **{user_name}**!\n\n"
         "Join our exclusive private VIP group for insights and community access.\n\n"
         "💰 **Price:** $40.00 USD / £30 GBP (5,200 KES)\n\n"
-        "Tap a button below to get started:",
-        reply_markup=reply_markup,
-        parse_mode="Markdown",
+        "Tap below to proceed:"
     )
-    return ConversationHandler.END
+
+    if update.message:
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
-async def start_pay_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Triggered when user clicks Pay. Asks for their email."""
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Triggers the support flow when /help is typed."""
+    await send_support_message(update, context)
+
+
+async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generates a 10-minute time-limited Paystack checkout link."""
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(
-        "✉️ **Please enter your email address:**\n\n"
-        "Paystack needs your email to issue your official receipt.",
-        parse_mode="Markdown",
-    )
-    return WAITING_FOR_EMAIL
-
-
-async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Captures email input, validates it, and generates Paystack checkout link."""
-    user_email = update.message.text.strip()
-
-    # Simple email validation regex
-    email_pattern = r"^[\w\.-]+@[\w\.-]+\.\w+$"
-    if not re.match(email_pattern, user_email):
-        await update.message.reply_text(
-            "⚠️ That doesn't look like a valid email address. Please type a valid email (e.g. `name@example.com`):",
-            parse_mode="Markdown",
-        )
-        return WAITING_FOR_EMAIL
-
-    user = update.effective_user
+    user = query.from_user
     reference = f"tg_{user.id}_{uuid.uuid4().hex[:8]}"
+    init_email = f"user_{user.id}@telegram.com"
 
-    # Inform the user we are processing
-    processing_msg = await update.message.reply_text("🔄 Generating your payment link...")
+    # Set Paystack link expiration timestamp (10 minutes from now)
+    expire_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=PAYMENT_TTL_MINUTES)
 
     headers = {
         "Authorization": f"Bearer {PAYSTACK_SECRET}",
         "Content-Type": "application/json",
     }
     payload = {
-        "email": user_email,  # Using the real email entered by the customer
+        "email": init_email,
         "amount": AMOUNT,
         "currency": "KES",
         "reference": reference,
+        "expire_after": expire_at.isoformat(),  # Paystack automated expiration
         "metadata": {
             "telegram_id": user.id,
             "telegram_username": user.username or "",
@@ -105,7 +145,7 @@ async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
         },
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         res = await client.post(
             "https://api.paystack.co/transaction/initialize",
             json=payload,
@@ -117,47 +157,62 @@ async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
         payment_url = data["data"]["authorization_url"]
 
         keyboard = [
-            [InlineKeyboardButton("💳 Complete $40 USD / £30 GBP Checkout", url=payment_url)]
+            [InlineKeyboardButton("💳 Complete Checkout on Paystack", url=payment_url)],
+            [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_start")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await processing_msg.edit_text(
-            f"✅ **Email saved:** `{user_email}`\n\n"
-            "Your payment link is ready! Click the button below to complete your payment on Paystack:\n\n"
+        message_text = (
+            "⚡️ **Payment Link Ready!**\n\n"
+            f"⏰ **Time Limit:** This link will expire in **{PAYMENT_TTL_MINUTES} minutes**.\n\n"
+            "You will be asked to enter your email on the checkout page for your official receipt.\n\n"
             "📌 *Note:* Checkout is processed in 5,200 KES (~$40 USD / £30 GBP). "
-            "Your bank will automatically convert this to your local currency.",
+            "Your bank converts this automatically."
+        )
+
+        sent_msg = await query.edit_message_text(
+            message_text,
             reply_markup=reply_markup,
             parse_mode="Markdown",
         )
+
+        # Schedule the expiration job in Telegram's JobQueue (600 seconds)
+        context.job_queue.run_once(
+            expire_payment_job,
+            when=PAYMENT_TTL_MINUTES * 60,
+            data={
+                "chat_id": sent_msg.chat_id,
+                "message_id": sent_msg.message_id,
+            },
+            name=f"expire_{reference}"
+        )
     else:
         print("Paystack error:", data)
-        await processing_msg.edit_text(
-            "Something went wrong generating your payment link. Please try again later with `/start`."
+        await query.edit_message_text(
+            "Something went wrong generating your payment link. Please try again in a moment.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_start")]]),
         )
 
-    return ConversationHandler.END
 
+async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Router for navigation buttons."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancels the conversation state."""
-    await update.message.reply_text("Operation canceled. Type `/start` to begin again.")
-    return ConversationHandler.END
+    if data == "support":
+        await send_support_message(update, context)
+    elif data == "back_start":
+        await start(update, context)
 
-
-# Set up the Conversation Handler
-pay_conversation = ConversationHandler(
-    entry_points=[CallbackQueryHandler(start_pay_flow, pattern="^pay$")],
-    states={
-        WAITING_FOR_EMAIL: [
-            MessageHandler(filters.TEXT & ~filters.COMMAND, receive_email)
-        ],
-    },
-    fallbacks=[CommandHandler("cancel", cancel)],
-)
 
 # Register Handlers
 telegram_app.add_handler(CommandHandler("start", start))
-telegram_app.add_handler(pay_conversation)
+telegram_app.add_handler(CommandHandler("help", help_command))
+telegram_app.add_handler(CommandHandler("support", help_command))
+
+telegram_app.add_handler(CallbackQueryHandler(pay_callback, pattern="^pay$"))
+telegram_app.add_handler(CallbackQueryHandler(button_router, pattern="^(support|back_start)$"))
 
 
 # ---------- Webhook Endpoint for Telegram Updates ----------
@@ -169,7 +224,7 @@ async def telegram_webhook(request: Request):
     return {"status": "ok"}
 
 
-# ---------- Paystack Webhook with Verification ----------
+# ---------- Paystack Webhook with Direct API Verification ----------
 @app.post("/paystack-webhook")
 async def paystack_webhook(request: Request):
     payload = await request.json()
@@ -185,9 +240,9 @@ async def paystack_webhook(request: Request):
     if not telegram_id or not reference:
         raise HTTPException(status_code=400, detail="Missing metadata")
 
-    # Double check transaction with Paystack API
+    # Double check transaction with Paystack API before issuing link
     headers = {"Authorization": f"Bearer {PAYSTACK_SECRET}"}
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         verify_res = await client.get(
             f"https://api.paystack.co/transaction/verify/{reference}",
             headers=headers,
