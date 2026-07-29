@@ -241,6 +241,9 @@ async def deliver_invite_link(telegram_id: str, fulfillment_id: str) -> dict:
         return {"status": "telegram_api_error", "detail": str(e)}
 
     try:
+        support_keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Link not working?", callback_data="support")]]
+        )
         # Plain text avoids Markdown parse errors on invite link characters
         await telegram_app.bot.send_message(
             chat_id=int(telegram_id),
@@ -250,6 +253,7 @@ async def deliver_invite_link(telegram_id: str, fulfillment_id: str) -> dict:
                 f"{invite_link}\n\n"
                 "Tap the link above to join now."
             ),
+            reply_markup=support_keyboard,
         )
         fulfilled_payment_ids.add(fulfillment_id)
         print(f"SUCCESS: DM delivered to user {telegram_id}")
