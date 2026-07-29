@@ -159,7 +159,7 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Content-Type": "application/json",
     }
     body = {
-        "plan": {"id": WHOP_PLAN_ID},
+        "plan_id": WHOP_PLAN_ID,
         "metadata": {"telegram_id": str(user.id)},
     }
 
@@ -177,17 +177,16 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if resp.status_code in [200, 201]:
             session_data = resp.json()
             config_id = session_data.get("id")
-            if config_id:
+            payment_url = session_data.get("purchase_url") or session_data.get("url")
+            if not payment_url and config_id:
                 payment_url = f"https://whop.com/checkout/{config_id}"
-                print(f"✅ Whop Session Link Created: {payment_url}")
-            else:
-                payment_url = session_data.get("purchase_url") or session_data.get("url")
+            print(f"✅ Whop Session Link Created: {payment_url}")
         else:
             print(f"Whop API Error ({resp.status_code}): {resp.text}")
     except Exception as e:
         print(f"Exception creating Whop checkout session: {e}")
 
-    # Fallback link structure if session generation hits an issue
+    # Fallback link structure if API creation ever fails
     if not payment_url:
         print("Using direct link fallback...")
         payment_url = (
@@ -242,11 +241,9 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start(update, context)
 
 
-# Register Handlers
+# Register button router handler
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("help", help_command))
-telegram_app.add_handler(CommandHandler("support", help_command))
-
 telegram_app.add_handler(CallbackQueryHandler(pay_callback, pattern="^pay$"))
 telegram_app.add_handler(
     CallbackQueryHandler(button_router, pattern="^(support|back_start)$")
@@ -298,7 +295,7 @@ async def whop_webhook(request: Request):
         print(f"Ignored unsupported event type: {event_type}")
         return {"status": "ignored", "reason": f"unsupported event: {event_type}"}
 
-    # Extract metadata objects across all Whop nested levels
+    # Extract metadata objects across all Whop payload locations
     metadata = (
         data.get("metadata", {})
         or payload.get("metadata", {})
@@ -352,13 +349,6 @@ async def whop_webhook(request: Request):
         return {"status": "dm_failed", "detail": str(e)}
 
     return {"status": "success"}
-
-
-# ---------- Legacy Dummy Route for Paystack Webhooks ----------
-@app.post("/paystack-webhook")
-async def paystack_webhook_dummy():
-    """Returns 200 OK to stop leftover Paystack retry attempts from cluttering Render logs."""
-    return {"status": "ignored"}
 
 
 # ---------- App Lifecycle ----------
