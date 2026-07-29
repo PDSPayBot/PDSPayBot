@@ -1,4 +1,5 @@
 import os
+import time
 import uuid
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -32,6 +33,10 @@ FULFILLMENT_EVENTS = {
 
 # Prevent duplicate invite links when Whop retries the same webhook
 fulfilled_payment_ids: set[str] = set()
+
+# Fallback mapping when checkout-configuration API is unavailable (ref -> telegram_id)
+pending_checkouts: dict[str, tuple[str, float]] = {}
+PENDING_CHECKOUT_TTL_SECONDS = PAYMENT_TTL_MINUTES * 60
 
 app = FastAPI()
 
@@ -88,6 +93,37 @@ def _metadata_dict(value) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _cleanup_pending_checkouts() -> None:
+    cutoff = time.time() - PENDING_CHECKOUT_TTL_SECONDS
+    expired = [ref for ref, (_, created_at) in pending_checkouts.items() if created_at < cutoff]
+    for ref in expired:
+        pending_checkouts.pop(ref, None)
+
+
+def register_pending_checkout(telegram_id: str) -> str:
+    """Store a short-lived ref so fallback checkout links can be matched on webhook."""
+    _cleanup_pending_checkouts()
+    checkout_ref = uuid.uuid4().hex[:12]
+    pending_checkouts[checkout_ref] = (str(telegram_id), time.time())
+    return checkout_ref
+
+
+def resolve_passthrough(passthrough: str | None) -> str | None:
+    if not passthrough:
+        return None
+
+    passthrough = str(passthrough)
+    _cleanup_pending_checkouts()
+    pending = pending_checkouts.get(passthrough)
+    if pending:
+        return pending[0]
+
+    # Direct passthrough may already be the Telegram user ID.
+    if passthrough.isdigit():
+        return passthrough
+    return None
+
+
 def extract_telegram_id(payload: dict, data: dict) -> str | None:
     """Pull telegram_id from every location Whop may place it."""
     metadata = {}
@@ -105,13 +141,60 @@ def extract_telegram_id(payload: dict, data: dict) -> str | None:
     for candidate in (
         metadata.get("telegram_id"),
         custom_fields.get("telegram_id"),
-        data.get("passthrough"),
-        payload.get("passthrough"),
+        resolve_passthrough(data.get("passthrough")),
+        resolve_passthrough(payload.get("passthrough")),
         data.get("telegram_id"),
     ):
         if candidate:
             return str(candidate)
     return None
+
+
+async def create_whop_checkout_session(telegram_id: str) -> tuple[str | None, str | None]:
+    """Create a Whop checkout session with metadata. Returns (payment_url, error_message)."""
+    headers = {
+        "Authorization": f"Bearer {WHOP_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "plan_id": WHOP_PLAN_ID,
+        "mode": "payment",
+        "metadata": {"telegram_id": str(telegram_id)},
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.whop.com/api/v1/checkout_configurations",
+                json=body,
+                headers=headers,
+                timeout=10.0,
+            )
+    except Exception as e:
+        print(f"Exception creating Whop checkout session: {e}")
+        return None, str(e)
+
+    if resp.status_code in (200, 201):
+        session_data = resp.json()
+        config_id = session_data.get("id")
+        payment_url = session_data.get("purchase_url") or session_data.get("url")
+        if not payment_url and config_id:
+            payment_url = (
+                f"https://whop.com/checkout/{WHOP_PLAN_ID}?session={config_id}"
+            )
+        print(f"Whop session link created: {payment_url}")
+        return payment_url, None
+
+    error_text = resp.text
+    print(f"Whop API Error ({resp.status_code}): {error_text}")
+
+    if resp.status_code == 400 and "permission" in error_text.lower():
+        print(
+            "FIX: Use a Company API key from the same Whop company that owns "
+            "WHOP_PLAN_ID, with checkout_configuration:create enabled. "
+            "Dashboard -> Developer -> Company API keys -> Create key."
+        )
+    return None, error_text
 
 
 async def fetch_telegram_id_from_checkout_config(config_id: str) -> str | None:
@@ -259,49 +342,18 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     user = query.from_user
+    telegram_id = str(user.id)
 
-    # Create checkout configuration directly with Whop API
-    headers = {
-        "Authorization": f"Bearer {WHOP_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "plan_id": WHOP_PLAN_ID,
-        "mode": "payment",
-        "metadata": {"telegram_id": str(user.id)},
-    }
+    payment_url, whop_error = await create_whop_checkout_session(telegram_id)
+    using_fallback = False
 
-    payment_url = None
-
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "https://api.whop.com/api/v1/checkout_configurations",
-                json=body,
-                headers=headers,
-                timeout=10.0,
-            )
-
-        if resp.status_code in [200, 201]:
-            session_data = resp.json()
-            config_id = session_data.get("id")
-            payment_url = session_data.get("purchase_url") or session_data.get("url")
-            if not payment_url and config_id:
-                payment_url = (
-                    f"https://whop.com/checkout/{WHOP_PLAN_ID}?session={config_id}"
-                )
-            print(f"✅ Whop Session Link Created: {payment_url}")
-        else:
-            print(f"Whop API Error ({resp.status_code}): {resp.text}")
-    except Exception as e:
-        print(f"Exception creating Whop checkout session: {e}")
-
-    # Fallback link structure if API creation ever fails
     if not payment_url:
-        print("Using direct link fallback...")
+        using_fallback = True
+        checkout_ref = register_pending_checkout(telegram_id)
+        print(f"Using direct link fallback with ref {checkout_ref}...")
         payment_url = (
             f"https://whop.com/checkout/{WHOP_PLAN_ID}?"
-            f"passthrough={user.id}&custom_fields[telegram_id]={user.id}"
+            f"passthrough={checkout_ref}"
         )
 
     keyboard = [
@@ -319,6 +371,11 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏰ **Time Limit:** This link will expire in **{PAYMENT_TTL_MINUTES} minutes**.\n\n"
         "Tap the checkout button below to complete your payment on Whop securely."
     )
+    if using_fallback and whop_error:
+        message_text += (
+            "\n\n_Note: checkout session could not be created via API. "
+            "If you pay and do not receive an invite, contact support._"
+        )
 
     sent_msg = await query.edit_message_text(
         message_text,
