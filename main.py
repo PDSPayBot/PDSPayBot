@@ -22,6 +22,17 @@ GROUP_ID = int(raw_group_id) if raw_group_id else None
 
 PAYMENT_TTL_MINUTES = 10  # 10 minute expiration period
 
+# Whop events that mean the customer paid and should receive an invite
+FULFILLMENT_EVENTS = {
+    "payment.succeeded",
+    "payment_succeeded",
+    "membership.went_valid",
+    "membership.activated",
+}
+
+# Prevent duplicate invite links when Whop retries the same webhook
+fulfilled_payment_ids: set[str] = set()
+
 app = FastAPI()
 
 # Build Telegram app with JobQueue enabled
@@ -68,6 +79,102 @@ async def expire_payment_job(context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         print(f"Could not update expired message: {e}")
+
+
+# ---------- Whop / Telegram Helpers ----------
+
+
+def _metadata_dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def extract_telegram_id(payload: dict, data: dict) -> str | None:
+    """Pull telegram_id from every location Whop may place it."""
+    metadata = {}
+    for source in (
+        data.get("metadata"),
+        payload.get("metadata"),
+        (data.get("plan") or {}).get("metadata"),
+        (data.get("product") or {}).get("metadata"),
+        (data.get("membership") or {}).get("metadata"),
+    ):
+        metadata.update(_metadata_dict(source))
+
+    custom_fields = _metadata_dict(data.get("custom_fields"))
+
+    for candidate in (
+        metadata.get("telegram_id"),
+        custom_fields.get("telegram_id"),
+        data.get("passthrough"),
+        payload.get("passthrough"),
+        data.get("telegram_id"),
+    ):
+        if candidate:
+            return str(candidate)
+    return None
+
+
+async def fetch_telegram_id_from_checkout_config(config_id: str) -> str | None:
+    """Fallback: read metadata from the checkout session Whop created at pay time."""
+    headers = {"Authorization": f"Bearer {WHOP_API_KEY}"}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"https://api.whop.com/api/v1/checkout_configurations/{config_id}",
+                headers=headers,
+                timeout=10.0,
+            )
+        if resp.status_code == 200:
+            return extract_telegram_id({}, resp.json())
+        print(
+            f"Could not fetch checkout config {config_id}: "
+            f"{resp.status_code} {resp.text}"
+        )
+    except Exception as e:
+        print(f"Exception fetching checkout config {config_id}: {e}")
+    return None
+
+
+async def deliver_invite_link(telegram_id: str, fulfillment_id: str) -> dict:
+    """Create a single-use invite link and DM it to the paying customer."""
+    if fulfillment_id in fulfilled_payment_ids:
+        print(f"Already fulfilled {fulfillment_id}, skipping duplicate webhook")
+        return {"status": "already_fulfilled"}
+
+    if not GROUP_ID:
+        print("ERROR: GROUP_ID is not configured in Environment Variables.")
+        return {"status": "error", "message": "GROUP_ID not set"}
+
+    try:
+        invite = await telegram_app.bot.create_chat_invite_link(
+            chat_id=GROUP_ID,
+            member_limit=1,
+            name=f"Paid-{telegram_id}",
+        )
+        invite_link = invite.invite_link
+        print(f"Generated Invite Link: {invite_link}")
+    except Exception as e:
+        print(f"ERROR creating invite link in Telegram: {e}")
+        return {"status": "telegram_api_error", "detail": str(e)}
+
+    try:
+        # Plain text avoids Markdown parse errors on invite link characters
+        await telegram_app.bot.send_message(
+            chat_id=int(telegram_id),
+            text=(
+                "🎉 Payment Successful & Verified!\n\n"
+                "Welcome to the community! Here is your exclusive, single-use invite link:\n\n"
+                f"{invite_link}\n\n"
+                "Tap the link above to join now."
+            ),
+        )
+        fulfilled_payment_ids.add(fulfillment_id)
+        print(f"SUCCESS: DM delivered to user {telegram_id}")
+    except Exception as e:
+        print(f"ERROR sending DM to user {telegram_id}: {e}")
+        return {"status": "dm_failed", "detail": str(e)}
+
+    return {"status": "success"}
 
 
 # ---------- Support Helper Function ----------
@@ -160,6 +267,7 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     body = {
         "plan_id": WHOP_PLAN_ID,
+        "mode": "payment",
         "metadata": {"telegram_id": str(user.id)},
     }
 
@@ -179,7 +287,9 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             config_id = session_data.get("id")
             payment_url = session_data.get("purchase_url") or session_data.get("url")
             if not payment_url and config_id:
-                payment_url = f"https://whop.com/checkout/{config_id}"
+                payment_url = (
+                    f"https://whop.com/checkout/{WHOP_PLAN_ID}?session={config_id}"
+                )
             print(f"✅ Whop Session Link Created: {payment_url}")
         else:
             print(f"Whop API Error ({resp.status_code}): {resp.text}")
@@ -274,81 +384,47 @@ async def whop_webhook(request: Request):
     print(f"Payload: {payload}")
 
     event_type = (
-        payload.get("action")
+        payload.get("type")
+        or payload.get("action")
         or payload.get("event")
-        or payload.get("type")
         or payload.get("event_type")
     )
     data = payload.get("data", payload)
 
     print(f"Detected Event Type: {event_type}")
 
-    valid_events = [
-        "payment.succeeded",
-        "payment_succeeded",
-        "membership.went_valid",
-        "membership.activated",
-        "payment.created",
-    ]
-
-    if event_type and event_type not in valid_events:
+    if event_type and event_type not in FULFILLMENT_EVENTS:
         print(f"Ignored unsupported event type: {event_type}")
         return {"status": "ignored", "reason": f"unsupported event: {event_type}"}
 
-    # Extract metadata objects across all Whop payload locations
-    metadata = (
-        data.get("metadata", {})
-        or payload.get("metadata", {})
-        or (data.get("plan", {}) or {}).get("metadata", {})
-    )
-    custom_fields = data.get("custom_fields", {}) or {}
+    if event_type in {"payment.succeeded", "payment_succeeded"}:
+        payment_status = data.get("status")
+        if payment_status and payment_status != "succeeded":
+            print(f"Ignored payment event with status: {payment_status}")
+            return {
+                "status": "ignored",
+                "reason": f"payment status: {payment_status}",
+            }
 
-    telegram_id = (
-        metadata.get("telegram_id")
-        or custom_fields.get("telegram_id")
-        or data.get("passthrough")
-        or payload.get("passthrough")
-        or data.get("telegram_id")
-    )
+    telegram_id = extract_telegram_id(payload, data)
+
+    if not telegram_id:
+        checkout_config_id = data.get("checkout_configuration_id")
+        if checkout_config_id:
+            print(
+                f"No telegram_id in webhook; fetching checkout config {checkout_config_id}"
+            )
+            telegram_id = await fetch_telegram_id_from_checkout_config(
+                checkout_config_id
+            )
 
     if not telegram_id:
         print("ERROR: Whop payload received without telegram_id!")
+        print(f"Event: {event_type}, data keys: {list(data.keys())}")
         return {"status": "missing_telegram_id"}
 
-    if not GROUP_ID:
-        print("ERROR: GROUP_ID is not configured in Environment Variables.")
-        return {"status": "error", "message": "GROUP_ID not set"}
-
-    try:
-        # Create 1-time single use invite link
-        invite = await telegram_app.bot.create_chat_invite_link(
-            chat_id=GROUP_ID,
-            member_limit=1,
-            name=f"Paid-{telegram_id}",
-        )
-        invite_link = invite.invite_link
-        print(f"Generated Invite Link: {invite_link}")
-    except Exception as e:
-        print(f"ERROR creating invite link in Telegram: {e}")
-        return {"status": "telegram_api_error", "detail": str(e)}
-
-    try:
-        await telegram_app.bot.send_message(
-            chat_id=int(telegram_id),
-            text=(
-                "🎉 *Payment Successful & Verified!*\n\n"
-                "Welcome to the community! Here is your exclusive, single-use invite link:\n\n"
-                f"{invite_link}\n\n"
-                "Click it above to join now."
-            ),
-            parse_mode="Markdown",
-        )
-        print(f"SUCCESS: DM delivered to user {telegram_id}")
-    except Exception as e:
-        print(f"ERROR sending DM to user {telegram_id}: {e}")
-        return {"status": "dm_failed", "detail": str(e)}
-
-    return {"status": "success"}
+    fulfillment_id = data.get("id") or payload.get("id") or f"{event_type}:{telegram_id}"
+    return await deliver_invite_link(telegram_id, fulfillment_id)
 
 
 # ---------- App Lifecycle ----------
