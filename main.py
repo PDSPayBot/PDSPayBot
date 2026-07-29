@@ -153,20 +153,22 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = query.from_user
 
-    # Generate an API Checkout Session directly with Whop
+    # Create checkout configuration directly with Whop API
     headers = {
         "Authorization": f"Bearer {WHOP_API_KEY}",
         "Content-Type": "application/json",
     }
     body = {
-        "plan_id": WHOP_PLAN_ID,
+        "plan": {"id": WHOP_PLAN_ID},
         "metadata": {"telegram_id": str(user.id)},
     }
+
+    payment_url = None
 
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                "https://api.whop.com/v5/checkout_sessions",
+                "https://api.whop.com/api/v1/checkout_configurations",
                 json=body,
                 headers=headers,
                 timeout=10.0,
@@ -174,17 +176,24 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if resp.status_code in [200, 201]:
             session_data = resp.json()
-            payment_url = session_data.get("url") or session_data.get(
-                "checkout_url"
-            )
+            config_id = session_data.get("id")
+            if config_id:
+                payment_url = f"https://whop.com/checkout/{config_id}"
+                print(f"✅ Whop Session Link Created: {payment_url}")
+            else:
+                payment_url = session_data.get("purchase_url") or session_data.get("url")
         else:
-            print(
-                f"Whop API Error ({resp.status_code}): {resp.text}. Falling back to standard link."
-            )
-            payment_url = f"https://whop.com/checkout/{WHOP_PLAN_ID}"
+            print(f"Whop API Error ({resp.status_code}): {resp.text}")
     except Exception as e:
         print(f"Exception creating Whop checkout session: {e}")
-        payment_url = f"https://whop.com/checkout/{WHOP_PLAN_ID}"
+
+    # Fallback link structure if session generation hits an issue
+    if not payment_url:
+        print("Using direct link fallback...")
+        payment_url = (
+            f"https://whop.com/checkout/{WHOP_PLAN_ID}?"
+            f"passthrough={user.id}&custom_fields[telegram_id]={user.id}"
+        )
 
     keyboard = [
         [
@@ -289,7 +298,7 @@ async def whop_webhook(request: Request):
         print(f"Ignored unsupported event type: {event_type}")
         return {"status": "ignored", "reason": f"unsupported event: {event_type}"}
 
-    # Extract metadata objects across payload levels
+    # Extract metadata objects across all Whop nested levels
     metadata = (
         data.get("metadata", {})
         or payload.get("metadata", {})
