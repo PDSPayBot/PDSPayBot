@@ -1,7 +1,7 @@
 import os
 import uuid
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -15,7 +15,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WHOP_API_KEY = os.getenv("WHOP_API_KEY")
-WHOP_PLAN_ID = os.getenv("WHOP_PLAN_ID")  # e.g., plan_xxxxxxxxxxxx
+WHOP_PLAN_ID = os.getenv("WHOP_PLAN_ID")  # e.g., plan_lKZLzJB0ZE0tk
 
 raw_group_id = os.getenv("GROUP_ID")
 GROUP_ID = int(raw_group_id) if raw_group_id else None
@@ -109,7 +109,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Main welcome message with direct Checkout and Support options."""
     user = update.effective_user
     username_str = f"@{user.username}" if user.username else "No Username"
-    print(f"👤 USER STARTED BOT: {user.first_name} | Username: {username_str} | ID: {user.id}")
+    print(
+        f"👤 USER STARTED BOT: {user.first_name} | Username: {username_str} | ID: {user.id}"
+    )
 
     keyboard = [
         [
@@ -145,17 +147,44 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generates a 10-minute time-limited Whop checkout link."""
+    """Generates a dynamic Whop Checkout Session with bound metadata."""
     query = update.callback_query
     await query.answer()
 
     user = query.from_user
 
-    # Pass user.id in both passthrough AND custom_fields so Whop retains it
-    payment_url = (
-        f"https://whop.com/checkout/{WHOP_PLAN_ID}?"
-        f"passthrough={user.id}&custom_fields[telegram_id]={user.id}"
-    )
+    # Generate an API Checkout Session directly with Whop
+    headers = {
+        "Authorization": f"Bearer {WHOP_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "plan_id": WHOP_PLAN_ID,
+        "metadata": {"telegram_id": str(user.id)},
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.whop.com/v5/checkout_sessions",
+                json=body,
+                headers=headers,
+                timeout=10.0,
+            )
+
+        if resp.status_code in [200, 201]:
+            session_data = resp.json()
+            payment_url = session_data.get("url") or session_data.get(
+                "checkout_url"
+            )
+        else:
+            print(
+                f"Whop API Error ({resp.status_code}): {resp.text}. Falling back to standard link."
+            )
+            payment_url = f"https://whop.com/checkout/{WHOP_PLAN_ID}"
+    except Exception as e:
+        print(f"Exception creating Whop checkout session: {e}")
+        payment_url = f"https://whop.com/checkout/{WHOP_PLAN_ID}"
 
     keyboard = [
         [
@@ -260,21 +289,20 @@ async def whop_webhook(request: Request):
         print(f"Ignored unsupported event type: {event_type}")
         return {"status": "ignored", "reason": f"unsupported event: {event_type}"}
 
-    # Extract telegram_id from every possible location in Whop's payload
+    # Extract metadata objects across payload levels
     metadata = (
         data.get("metadata", {})
         or payload.get("metadata", {})
-        or data.get("custom_fields", {})
+        or (data.get("plan", {}) or {}).get("metadata", {})
     )
     custom_fields = data.get("custom_fields", {}) or {}
 
     telegram_id = (
-        data.get("passthrough")
-        or payload.get("passthrough")
-        or metadata.get("telegram_id")
+        metadata.get("telegram_id")
         or custom_fields.get("telegram_id")
+        or data.get("passthrough")
+        or payload.get("passthrough")
         or data.get("telegram_id")
-        or payload.get("telegram_id")
     )
 
     if not telegram_id:
