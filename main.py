@@ -1,26 +1,25 @@
 import os
 import uuid
-import datetime
-import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import httpx
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
-    CommandHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
 )
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY")
+WHOP_API_KEY = os.getenv("WHOP_API_KEY")
+WHOP_PLAN_ID = os.getenv("WHOP_PLAN_ID")  # e.g., plan_xxxxxxxxxxxx
 
 raw_group_id = os.getenv("GROUP_ID")
 GROUP_ID = int(raw_group_id) if raw_group_id else None
 
-AMOUNT = 520000  # 5,200 KES in subunits (approx $40 USD / £30 GBP)
 PAYMENT_TTL_MINUTES = 10  # 10 minute expiration period
 
 app = FastAPI()
@@ -39,6 +38,7 @@ telegram_app = (
 
 # ---------- Expiration Job Handler ----------
 
+
 async def expire_payment_job(context: ContextTypes.DEFAULT_TYPE):
     """Job triggered after 10 minutes to revoke the payment button in chat."""
     job_data = context.job.data
@@ -46,7 +46,13 @@ async def expire_payment_job(context: ContextTypes.DEFAULT_TYPE):
     message_id = job_data["message_id"]
 
     try:
-        keyboard = [[InlineKeyboardButton("🔄 Generate New Payment Link", callback_data="pay")]]
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "🔄 Generate New Payment Link", callback_data="pay"
+                )
+            ]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         await context.bot.edit_message_text(
@@ -66,7 +72,10 @@ async def expire_payment_job(context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Support Helper Function ----------
 
-async def send_support_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def send_support_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
     """Reusable function for Support via command or button click."""
     text = (
         "💬 **Contact Support**\n\n"
@@ -74,7 +83,13 @@ async def send_support_message(update: Update, context: ContextTypes.DEFAULT_TYP
         "please reach out to our team. We will get back to you as soon as possible!\n\n"
         "👉 Message directly: @pewee7"
     )
-    keyboard = [[InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_start")]]
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "⬅️ Back to Main Menu", callback_data="back_start"
+            )
+        ]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if update.callback_query:
@@ -89,10 +104,15 @@ async def send_support_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ---------- Telegram Command Handlers ----------
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Main welcome message with direct Checkout and Support options."""
     keyboard = [
-        [InlineKeyboardButton("💳 Pay $40.00 USD / £30 GBP", callback_data="pay")],
+        [
+            InlineKeyboardButton(
+                "💳 Pay $40.00 USD / £30 GBP", callback_data="pay"
+            )
+        ],
         [InlineKeyboardButton("💬 Support / Help", callback_data="support")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -101,14 +121,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"👋 Hey **{user_name}**!\n\n"
         "Join our exclusive private VIP group for insights and community access.\n\n"
-        "💰 **Price:** $40.00 USD / £30 GBP (5,200 KES)\n\n"
+        "💰 **Price:** $40.00 USD / £30 GBP\n\n"
         "Tap below to proceed:"
     )
 
     if update.message:
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        await update.message.reply_text(
+            text, reply_markup=reply_markup, parse_mode="Markdown"
+        )
     elif update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        await update.callback_query.edit_message_text(
+            text, reply_markup=reply_markup, parse_mode="Markdown"
+        )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -117,81 +141,49 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generates a 10-minute time-limited Paystack checkout link."""
+    """Generates a 10-minute time-limited Whop checkout link."""
     query = update.callback_query
     await query.answer()
 
     user = query.from_user
-    reference = f"tg_{user.id}_{uuid.uuid4().hex[:8]}"
-    init_email = f"user_{user.id}@telegram.com"
 
-    # Set Paystack link expiration timestamp (10 minutes from now)
-    expire_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=PAYMENT_TTL_MINUTES)
+    # Construct the Whop direct checkout URL with embedded metadata
+    # (Whop passes passthrough metadata via parameter or direct checkout URL)
+    payment_url = f"https://whop.com/checkout/{WHOP_PLAN_ID}?metadata[telegram_id]={user.id}"
 
-    headers = {
-        "Authorization": f"Bearer {PAYSTACK_SECRET}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "email": init_email,
-        "amount": AMOUNT,
-        "currency": "KES",
-        "reference": reference,
-        "expire_after": expire_at.isoformat(),  # Paystack automated expiration
-        "metadata": {
-            "telegram_id": user.id,
-            "telegram_username": user.username or "",
-            "telegram_name": user.full_name,
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "💳 Complete Checkout on Whop", url=payment_url
+            )
+        ],
+        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_start")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    message_text = (
+        "⚡️ **Payment Link Ready!**\n\n"
+        f"⏰ **Time Limit:** This link will expire in **{PAYMENT_TTL_MINUTES} minutes**.\n\n"
+        "Tap the checkout button below to complete your payment on Whop securely."
+    )
+
+    sent_msg = await query.edit_message_text(
+        message_text,
+        reply_markup=reply_markup,
+        parse_mode="Markdown",
+    )
+
+    # Schedule the 10-minute message expiration timer in Telegram's JobQueue
+    ref_id = uuid.uuid4().hex[:8]
+    context.job_queue.run_once(
+        expire_payment_job,
+        when=PAYMENT_TTL_MINUTES * 60,
+        data={
+            "chat_id": sent_msg.chat_id,
+            "message_id": sent_msg.message_id,
         },
-    }
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.post(
-            "https://api.paystack.co/transaction/initialize",
-            json=payload,
-            headers=headers,
-        )
-        data = res.json()
-
-    if data.get("status"):
-        payment_url = data["data"]["authorization_url"]
-
-        keyboard = [
-            [InlineKeyboardButton("💳 Complete Checkout on Paystack", url=payment_url)],
-            [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_start")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        message_text = (
-            "⚡️ **Payment Link Ready!**\n\n"
-            f"⏰ **Time Limit:** This link will expire in **{PAYMENT_TTL_MINUTES} minutes**.\n\n"
-            "You will be asked to enter your email on the checkout page for your official receipt.\n\n"
-            "📌 *Note:* Checkout is processed in 5,200 KES (~$40 USD / £30 GBP). "
-            "Your bank converts this automatically."
-        )
-
-        sent_msg = await query.edit_message_text(
-            message_text,
-            reply_markup=reply_markup,
-            parse_mode="Markdown",
-        )
-
-        # Schedule the expiration job in Telegram's JobQueue (600 seconds)
-        context.job_queue.run_once(
-            expire_payment_job,
-            when=PAYMENT_TTL_MINUTES * 60,
-            data={
-                "chat_id": sent_msg.chat_id,
-                "message_id": sent_msg.message_id,
-            },
-            name=f"expire_{reference}"
-        )
-    else:
-        print("Paystack error:", data)
-        await query.edit_message_text(
-            "Something went wrong generating your payment link. Please try again in a moment.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_start")]]),
-        )
+        name=f"expire_{ref_id}",
+    )
 
 
 async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -212,7 +204,9 @@ telegram_app.add_handler(CommandHandler("help", help_command))
 telegram_app.add_handler(CommandHandler("support", help_command))
 
 telegram_app.add_handler(CallbackQueryHandler(pay_callback, pattern="^pay$"))
-telegram_app.add_handler(CallbackQueryHandler(button_router, pattern="^(support|back_start)$"))
+telegram_app.add_handler(
+    CallbackQueryHandler(button_router, pattern="^(support|back_start)$")
+)
 
 
 # ---------- Webhook Endpoint for Telegram Updates ----------
@@ -224,40 +218,34 @@ async def telegram_webhook(request: Request):
     return {"status": "ok"}
 
 
-# ---------- Paystack Webhook with Direct API Verification ----------
-@app.post("/paystack-webhook")
-async def paystack_webhook(request: Request):
+# ---------- Whop Webhook Handler ----------
+@app.post("/whop-webhook")
+async def whop_webhook(request: Request):
     payload = await request.json()
 
-    if payload.get("event") != "charge.success":
+    # Whop sends events like 'payment.succeeded' or 'membership.went_valid'
+    event_type = payload.get("action") or payload.get("event")
+    data = payload.get("data", {})
+
+    if event_type not in ["payment.succeeded", "membership.went_valid"]:
         return {"status": "ignored"}
 
-    data = payload.get("data", {})
-    reference = data.get("reference")
+    # Retrieve custom telegram_id passed in metadata
     metadata = data.get("metadata", {})
-    telegram_id = metadata.get("telegram_id")
+    telegram_id = metadata.get("telegram_id") or data.get("custom_fields", {}).get(
+        "telegram_id"
+    )
 
-    if not telegram_id or not reference:
-        raise HTTPException(status_code=400, detail="Missing metadata")
-
-    # Double check transaction with Paystack API before issuing link
-    headers = {"Authorization": f"Bearer {PAYSTACK_SECRET}"}
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        verify_res = await client.get(
-            f"https://api.paystack.co/transaction/verify/{reference}",
-            headers=headers,
-        )
-        verify_data = verify_res.json()
-
-    if not verify_data.get("status") or verify_data.get("data", {}).get("status") != "success":
-        print(f"Unverified payment attempt for reference: {reference}")
-        return {"status": "unverified"}
+    if not telegram_id:
+        print("Whop webhook received without telegram_id metadata.")
+        return {"status": "missing_metadata"}
 
     if not GROUP_ID:
         print("Error: GROUP_ID is not configured in Environment Variables.")
         return {"status": "error", "message": "GROUP_ID not set"}
 
     try:
+        # Create 1-time single use invite link
         invite = await telegram_app.bot.create_chat_invite_link(
             chat_id=GROUP_ID,
             member_limit=1,
@@ -270,7 +258,7 @@ async def paystack_webhook(request: Request):
 
     try:
         await telegram_app.bot.send_message(
-            chat_id=telegram_id,
+            chat_id=int(telegram_id),
             text=(
                 "🎉 *Payment Successful & Verified!*\n\n"
                 "Welcome to the community! Here is your exclusive, single-use invite link:\n\n"
