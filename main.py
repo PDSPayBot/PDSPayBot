@@ -148,7 +148,6 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
 
     # Construct the Whop direct checkout URL with embedded metadata
-    # (Whop passes passthrough metadata via parameter or direct checkout URL)
     payment_url = f"https://whop.com/checkout/{WHOP_PLAN_ID}?metadata[telegram_id]={user.id}"
 
     keyboard = [
@@ -223,7 +222,6 @@ async def telegram_webhook(request: Request):
 async def whop_webhook(request: Request):
     payload = await request.json()
 
-    # Whop sends events like 'payment.succeeded' or 'membership.went_valid'
     event_type = payload.get("action") or payload.get("event")
     data = payload.get("data", {})
 
@@ -271,6 +269,13 @@ async def whop_webhook(request: Request):
         print("Error sending message to user:", e)
 
     return {"status": "success"}
+
+
+# ---------- Legacy Dummy Route for Paystack Webhooks ----------
+@app.post("/paystack-webhook")
+async def paystack_webhook_dummy():
+    """Returns 200 OK to stop leftover Paystack retry attempts from cluttering Render logs."""
+    return {"status": "ignored"}
 
 
 # ---------- App Lifecycle ----------
