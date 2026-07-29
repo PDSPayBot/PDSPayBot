@@ -147,8 +147,11 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = query.from_user
 
-    # Construct the Whop direct checkout URL with embedded metadata
-    payment_url = f"https://whop.com/checkout/{WHOP_PLAN_ID}?metadata[telegram_id]={user.id}"
+    # Pass user.id in both passthrough AND custom_fields so Whop retains it
+    payment_url = (
+        f"https://whop.com/checkout/{WHOP_PLAN_ID}?"
+        f"passthrough={user.id}&custom_fields[telegram_id]={user.id}"
+    )
 
     keyboard = [
         [
@@ -208,6 +211,13 @@ telegram_app.add_handler(
 )
 
 
+# ---------- Root Route (For Scanners/Health Checks) ----------
+@app.get("/")
+@app.post("/")
+async def root_health_check():
+    return {"status": "bot is running online"}
+
+
 # ---------- Webhook Endpoint for Telegram Updates ----------
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
@@ -221,25 +231,51 @@ async def telegram_webhook(request: Request):
 @app.post("/whop-webhook")
 async def whop_webhook(request: Request):
     payload = await request.json()
+    print("--- INCOMING WHOP WEBHOOK ---")
+    print(f"Payload: {payload}")
 
-    event_type = payload.get("action") or payload.get("event")
-    data = payload.get("data", {})
+    event_type = (
+        payload.get("action")
+        or payload.get("event")
+        or payload.get("type")
+        or payload.get("event_type")
+    )
+    data = payload.get("data", payload)
 
-    if event_type not in ["payment.succeeded", "membership.went_valid"]:
-        return {"status": "ignored"}
+    print(f"Detected Event Type: {event_type}")
 
-    # Retrieve custom telegram_id passed in metadata
-    metadata = data.get("metadata", {})
-    telegram_id = metadata.get("telegram_id") or data.get("custom_fields", {}).get(
-        "telegram_id"
+    valid_events = [
+        "payment.succeeded",
+        "payment_succeeded",
+        "membership.went_valid",
+        "membership.activated",
+        "payment.created",
+    ]
+
+    if event_type and event_type not in valid_events:
+        print(f"Ignored unsupported event type: {event_type}")
+        return {"status": "ignored", "reason": f"unsupported event: {event_type}"}
+
+    # Extract telegram_id from passthrough, metadata, or custom_fields
+    metadata = (
+        data.get("metadata", {})
+        or payload.get("metadata", {})
+        or data.get("custom_fields", {})
+    )
+
+    telegram_id = (
+        data.get("passthrough")
+        or payload.get("passthrough")
+        or metadata.get("telegram_id")
+        or data.get("telegram_id")
     )
 
     if not telegram_id:
-        print("Whop webhook received without telegram_id metadata.")
-        return {"status": "missing_metadata"}
+        print("ERROR: Whop payload received without telegram_id!")
+        return {"status": "missing_telegram_id"}
 
     if not GROUP_ID:
-        print("Error: GROUP_ID is not configured in Environment Variables.")
+        print("ERROR: GROUP_ID is not configured in Environment Variables.")
         return {"status": "error", "message": "GROUP_ID not set"}
 
     try:
@@ -250,9 +286,10 @@ async def whop_webhook(request: Request):
             name=f"Paid-{telegram_id}",
         )
         invite_link = invite.invite_link
+        print(f"Generated Invite Link: {invite_link}")
     except Exception as e:
-        print("Error creating invite:", e)
-        return {"status": "error"}
+        print(f"ERROR creating invite link in Telegram: {e}")
+        return {"status": "telegram_api_error", "detail": str(e)}
 
     try:
         await telegram_app.bot.send_message(
@@ -265,8 +302,10 @@ async def whop_webhook(request: Request):
             ),
             parse_mode="Markdown",
         )
+        print(f"SUCCESS: DM delivered to user {telegram_id}")
     except Exception as e:
-        print("Error sending message to user:", e)
+        print(f"ERROR sending DM to user {telegram_id}: {e}")
+        return {"status": "dm_failed", "detail": str(e)}
 
     return {"status": "success"}
 
