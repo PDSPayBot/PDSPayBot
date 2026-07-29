@@ -107,6 +107,10 @@ async def send_support_message(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Main welcome message with direct Checkout and Support options."""
+    user = update.effective_user
+    username_str = f"@{user.username}" if user.username else "No Username"
+    print(f"👤 USER STARTED BOT: {user.first_name} | Username: {username_str} | ID: {user.id}")
+
     keyboard = [
         [
             InlineKeyboardButton(
@@ -117,7 +121,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    user_name = update.effective_user.first_name
+    user_name = user.first_name
     text = (
         f"👋 Hey **{user_name}**!\n\n"
         "Join our exclusive private VIP group for insights and community access.\n\n"
@@ -256,18 +260,21 @@ async def whop_webhook(request: Request):
         print(f"Ignored unsupported event type: {event_type}")
         return {"status": "ignored", "reason": f"unsupported event: {event_type}"}
 
-    # Extract telegram_id from passthrough, metadata, or custom_fields
+    # Extract telegram_id from every possible location in Whop's payload
     metadata = (
         data.get("metadata", {})
         or payload.get("metadata", {})
         or data.get("custom_fields", {})
     )
+    custom_fields = data.get("custom_fields", {}) or {}
 
     telegram_id = (
         data.get("passthrough")
         or payload.get("passthrough")
         or metadata.get("telegram_id")
+        or custom_fields.get("telegram_id")
         or data.get("telegram_id")
+        or payload.get("telegram_id")
     )
 
     if not telegram_id:
