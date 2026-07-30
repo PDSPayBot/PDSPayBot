@@ -16,7 +16,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WHOP_API_KEY = os.getenv("WHOP_API_KEY")
-WHOP_PLAN_ID = os.getenv("WHOP_PLAN_ID")  # e.g., plan_lKZLzJB0ZE0tk
+WHOP_PLAN_ID = os.getenv("WHOP_PLAN_ID")  # e.g., plan_FrCqd0ObevedE
 
 raw_group_id = os.getenv("GROUP_ID")
 GROUP_ID = int(raw_group_id) if raw_group_id else None
@@ -310,7 +310,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [
             InlineKeyboardButton(
-                "💳 Pay $40.00 USD / £30 GBP", callback_data="pay"
+                "💳 Pay $30.00 USD / £22 GBP", callback_data="pay"
             )
         ],
         [InlineKeyboardButton("💬 Support / Help", callback_data="support")],
@@ -321,7 +321,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"👋 Hey **{user_name}**!\n\n"
         "Join our exclusive private VIP group for insights and community access.\n\n"
-        "💰 **Price:** $40.00 USD / £30 GBP\n\n"
+        "💰 **Price:** $30.00 USD / £22 GBP\n\n"
         "Tap below to proceed:"
     )
 
