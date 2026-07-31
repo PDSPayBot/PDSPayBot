@@ -23,6 +23,18 @@ GROUP_ID = int(raw_group_id) if raw_group_id else None
 
 PAYMENT_TTL_MINUTES = 10  # 10 minute expiration period
 
+MAINTENANCE_MESSAGE = (
+    "🔧 **Temporarily Unavailable**\n\n"
+    "We're currently taking a short break and are not accepting new "
+    "memberships at the moment.\n\n"
+    "Please check back soon!"
+)
+
+
+def is_bot_asleep() -> bool:
+    """True when BOT_SLEEP is enabled on Render/env."""
+    return os.getenv("BOT_SLEEP", "").strip().lower() in {"1", "true", "yes", "on"}
+
 # Whop events that mean the customer paid and should receive an invite
 FULFILLMENT_EVENTS = {
     "payment.succeeded",
@@ -62,6 +74,20 @@ async def expire_payment_job(context: ContextTypes.DEFAULT_TYPE):
     message_id = job_data["message_id"]
 
     try:
+        if is_bot_asleep():
+            keyboard = [
+                [InlineKeyboardButton("💬 Support / Help", callback_data="support")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=MAINTENANCE_MESSAGE,
+                reply_markup=reply_markup,
+                parse_mode="Markdown",
+            )
+            return
+
         keyboard = [
             [
                 InlineKeyboardButton(
@@ -267,6 +293,29 @@ async def deliver_invite_link(telegram_id: str, fulfillment_id: str) -> dict:
 # ---------- Support Helper Function ----------
 
 
+async def send_maintenance_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """Shown while BOT_SLEEP is enabled — no checkout available."""
+    keyboard = [
+        [InlineKeyboardButton("💬 Support / Help", callback_data="support")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            MAINTENANCE_MESSAGE,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+    elif update.message:
+        await update.message.reply_text(
+            MAINTENANCE_MESSAGE,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+
+
 async def send_support_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
@@ -307,6 +356,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👤 USER STARTED BOT: {user.first_name} | Username: {username_str} | ID: {user.id}"
     )
 
+    if is_bot_asleep():
+        await send_maintenance_message(update, context)
+        return
+
     keyboard = [
         [
             InlineKeyboardButton(
@@ -344,6 +397,10 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generates a dynamic Whop Checkout Session with bound metadata."""
     query = update.callback_query
     await query.answer()
+
+    if is_bot_asleep():
+        await send_maintenance_message(update, context)
+        return
 
     user = query.from_user
     telegram_id = str(user.id)
@@ -440,6 +497,10 @@ async def telegram_webhook(request: Request):
 # ---------- Whop Webhook Handler ----------
 @app.post("/whop-webhook")
 async def whop_webhook(request: Request):
+    if is_bot_asleep():
+        print("Whop webhook ignored — BOT_SLEEP is enabled")
+        return {"status": "ignored", "reason": "maintenance_mode"}
+
     payload = await request.json()
     print("--- INCOMING WHOP WEBHOOK ---")
     print(f"Payload: {payload}")
@@ -491,6 +552,8 @@ async def whop_webhook(request: Request):
 # ---------- App Lifecycle ----------
 @app.on_event("startup")
 async def on_startup():
+    if is_bot_asleep():
+        print("BOT_SLEEP is enabled — maintenance mode active (no payments)")
     await telegram_app.initialize()
     await telegram_app.start()
 
