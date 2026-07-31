@@ -33,7 +33,8 @@ MAINTENANCE_MESSAGE = (
 
 def is_bot_asleep() -> bool:
     """True when BOT_SLEEP is enabled on Render/env."""
-    return os.getenv("BOT_SLEEP", "").strip().lower() in {"1", "true", "yes", "on"}
+    value = os.getenv("BOT_SLEEP", "").strip().lower().strip('"').strip("'")
+    return value in {"1", "true", "yes", "on"}
 
 # Whop events that mean the customer paid and should receive an invite
 FULFILLMENT_EVENTS = {
@@ -482,7 +483,10 @@ telegram_app.add_handler(
 @app.get("/")
 @app.post("/")
 async def root_health_check():
-    return {"status": "bot is running online"}
+    return {
+        "status": "bot is running online",
+        "maintenance_mode": is_bot_asleep(),
+    }
 
 
 # ---------- Webhook Endpoint for Telegram Updates ----------
